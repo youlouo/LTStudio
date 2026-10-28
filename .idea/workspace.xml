@@ -4,28 +4,13 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="479e7de5-1df7-4346-8217-46e133fca3c0" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/engine/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/engine/audio_engine.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/engine/crash_journal.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/engine/dsp_chain.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/engine/mastering.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/engine/transcription.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/export/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/export/exporter.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/project/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/project/edl.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/project/storage.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/tests/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/tests/test_suite.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/ui/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/ui/main_window.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/ui/widgets.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/LTStudio.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/LTStudio.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
+    <list default="true" id="479e7de5-1df7-4346-8217-46e133fca3c0" name="Changes" comment="LTStudio 1.0">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/engine/transcription.py" beforeDir="false" afterPath="$PROJECT_DIR$/engine/transcription.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/project/edl.py" beforeDir="false" afterPath="$PROJECT_DIR$/project/edl.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/main_window.py" beforeDir="false" afterPath="$PROJECT_DIR$/ui/main_window.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ui/widgets.py" beforeDir="false" afterPath="$PROJECT_DIR$/ui/widgets.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -42,21 +27,24 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
-  <component name="GitHubPullRequestSearchHistory"><![CDATA[{
-  "lastFilter": {
-    "state": "OPEN",
-    "assignee": "youlouo"
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;youlouo&quot;
   }
-}]]></component>
-  <component name="GithubPullRequestsUISettings"><![CDATA[{
-  "selectedUrlAndAccountId": {
-    "url": "https://github.com/youlouo/LTStudio.git",
-    "accountId": "0d7da2ef-32d9-426b-b9b9-acdfddfaf204"
+}</component>
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/youlouo/LTStudio.git&quot;,
+    &quot;accountId&quot;: &quot;0d7da2ef-32d9-426b-b9b9-acdfddfaf204&quot;
   }
-}]]></component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "associatedIndex": 1
-}]]></component>
+}</component>
+  <component name="ProblemsViewState">
+    <option name="selectedTabId" value="CurrentFile" />
+  </component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 1
+}</component>
   <component name="ProjectId" id="3LJgbqMa1CNMo5KKSu71jZ6nkCf" />
   <component name="ProjectLevelVcsManager" settingsEditedManually="true">
     <ConfirmationsSetting value="2" id="Add" />
@@ -69,6 +57,7 @@
   "keyToString": {
     "Python.main.executor": "Run",
     "Python.storage.executor": "Run",
+    "Python.transcription.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "git-widget-placeholder": "master"
   }
@@ -89,6 +78,19 @@
       <option name="presentableId" value="Default" />
       <updated>1793177658238</updated>
     </task>
+    <task id="LOCAL-00001" summary="LTStudio 1.0">
+      <option name="closed" value="true" />
+      <created>1793181378804</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1793181378804</updated>
+    </task>
+    <option name="localTasksCounter" value="2" />
     <servers />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="LTStudio 1.0" />
+    <option name="LAST_COMMIT_MESSAGE" value="LTStudio 1.0" />
   </component>
 </project>
