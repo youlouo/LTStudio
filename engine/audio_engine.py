@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import numpy as np
+import soundfile as sf
 
 from engine.crash_journal import CrashRecoveryJournal
 from engine.dsp_chain import DSPEffectChain, PitchTimeShiftPlugin
@@ -29,7 +30,8 @@ class AudioTelemetry:
 class VoiceAudioEngine:
     """
     Независимый аудио-движок студийного класса LTStudio.
-    Управляет записью, мониторингом, воспроизведением через звуковую карту и телеметрией.
+    Управляет записью (с выдачей живого буфера для отрисовки на дорожке),
+    мониторингом, воспроизведением проекта и изолированным предпрослушиванием файлов.
     """
 
     SUPPORTED_SAMPLE_RATES = (44100, 48000, 96000)
@@ -48,10 +50,10 @@ class VoiceAudioEngine:
         self.dsp_chain = DSPEffectChain()
         self.journal = CrashRecoveryJournal(self.workspace_dir / "journals")
 
-        # Состояние транспорта
         self.is_recording: bool = False
         self.is_paused: bool = False
         self.is_playing: bool = False
+        self.is_previewing: bool = False
         self.monitoring_enabled: bool = False
         self.monitor_with_fx: bool = True
         self.playback_speed: float = 1.0
@@ -67,9 +69,9 @@ class VoiceAudioEngine:
         self._sd_stream: Any = None
         self._play_stream: Any = None
 
-    # ------------------------------------------------------------------
-    # Управление аудиоустройствами
-    # ------------------------------------------------------------------
+        self._preview_buffer: np.ndarray = np.zeros((0, 1), dtype=np.float32)
+        self._preview_cursor: int = 0
+        self._preview_stream: Any = None
 
     @staticmethod
     def list_audio_devices() -> List[Dict[str, Any]]:
@@ -107,14 +109,24 @@ class VoiceAudioEngine:
         self.dsp_chain.reset_all(self.sample_rate, self.channels)
 
     # ------------------------------------------------------------------
-    # Запись, пауза, маркеры и Crash-Recovery
+    # Запись, живой буфер для отрисовки и Crash-Recovery
     # ------------------------------------------------------------------
+
+    def get_live_recording_mono(self) -> np.ndarray:
+        """Возвращает текущий накопленный моно-массив во время записи для живой отрисовки на дорожке."""
+        if not self.is_recording or not self._recorded_chunks:
+            return np.zeros(0, dtype=np.float32)
+        snapshot = list(self._recorded_chunks)
+        if not snapshot:
+            return np.zeros(0, dtype=np.float32)
+        full = np.vstack(snapshot)
+        return full[:, 0] if full.ndim > 1 else full
 
     def start_recording(self, input_device: Optional[int] = None) -> None:
         if self.is_recording:
             return
-        if self.is_playing:
-            self.stop_playback()
+        self.stop_playback()
+        self.stop_preview()
 
         self.is_recording = True
         self.is_paused = False
@@ -200,8 +212,9 @@ class VoiceAudioEngine:
         saved_path = self.journal.finalize_to_audio_file(target_path, subtype=self.bit_depth)
         if self._recorded_chunks:
             full_audio = np.vstack(self._recorded_chunks)
-            # Заменяем текущий таймлайн свежей записью или добавляем к существующей
-            self.timeline.register_source(saved_path.stem, full_audio, append_to_timeline=True)
+            self.timeline.register_source(
+                saved_path.stem, full_audio, append_to_timeline=True, file_path=str(saved_path)
+            )
         return saved_path
 
     def _disk_writer_worker(self) -> None:
@@ -223,7 +236,76 @@ class VoiceAudioEngine:
             outdata.fill(0.0)
 
     # ------------------------------------------------------------------
-    # Воспроизведение через колонки/наушники, перемотка, Loop, скорость
+    # Изолированное прослушивание файла из вкладки «Записи»
+    # ------------------------------------------------------------------
+
+    def start_file_preview(self, file_path: Path, output_device: Optional[int] = None) -> bool:
+        if self.is_recording:
+            return False
+        self.stop_playback()
+        self.stop_preview()
+
+        try:
+            audio, sr = sf.read(str(file_path), dtype="float32", always_2d=True)
+            if audio.size == 0:
+                return False
+            self._preview_buffer = audio
+            self._preview_cursor = 0
+            self.is_previewing = True
+
+            import sounddevice as sd
+            self._preview_stream = sd.OutputStream(
+                samplerate=sr,
+                blocksize=self.block_size,
+                device=output_device,
+                channels=audio.shape[1],
+                dtype="float32",
+                callback=self._preview_audio_callback,
+            )
+            self._preview_stream.start()
+            return True
+        except Exception:
+            self.is_previewing = False
+            self._preview_stream = None
+            return False
+
+    def stop_preview(self) -> None:
+        self.is_previewing = False
+        if self._preview_stream is not None:
+            try:
+                self._preview_stream.stop()
+                self._preview_stream.close()
+            except Exception:
+                pass
+            self._preview_stream = None
+
+    def _preview_audio_callback(self, outdata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
+        if not self.is_previewing or self._preview_buffer.size == 0:
+            outdata.fill(0.0)
+            import sounddevice as sd
+            raise sd.CallbackStop()
+
+        total = self._preview_buffer.shape[0]
+        end_pos = self._preview_cursor + frames
+        if end_pos <= total:
+            chunk = self._preview_buffer[self._preview_cursor : end_pos]
+            self._preview_cursor = end_pos
+        else:
+            part1 = self._preview_buffer[self._preview_cursor : total]
+            rem = frames - len(part1)
+            part2 = np.zeros((rem, self._preview_buffer.shape[1]), dtype=np.float32)
+            chunk = np.vstack([part1, part2]) if len(part1) > 0 else part2
+            self.is_previewing = False
+
+        outdata[:] = chunk[:, : outdata.shape[1]]
+        self._update_telemetry(chunk, frame_pos=self.telemetry.current_frame)
+
+        if not self.is_previewing:
+            import sounddevice as sd
+            raise sd.CallbackStop()
+
+    # ------------------------------------------------------------------
+    # Воспроизведение многодорожечного проекта
     # ------------------------------------------------------------------
 
     def prepare_playback_buffer(self) -> np.ndarray:
@@ -240,16 +322,15 @@ class VoiceAudioEngine:
         return processed
 
     def seek(self, frame: int) -> None:
-        """Перемотка курсора воспроизведения к указанному сэмплу."""
         total = self._play_buffer.shape[0] if self._play_buffer.size > 0 else self.timeline.total_frames
         self._play_cursor = max(0, min(max(0, total - 1), int(frame)))
         self.telemetry.current_frame = self._play_cursor
         self.telemetry.current_time_sec = self._play_cursor / max(1, self.sample_rate)
 
     def start_playback(self, start_frame: Optional[int] = None, output_device: Optional[int] = None) -> bool:
-        """Запускает реальное воспроизведение звука через OutputStream звуковой карты."""
         if self.is_recording:
             return False
+        self.stop_preview()
         self.stop_playback()
         self.prepare_playback_buffer()
         if self._play_buffer.shape[0] == 0:
@@ -287,7 +368,6 @@ class VoiceAudioEngine:
             return True
 
     def stop_playback(self) -> None:
-        """Останавливает воспроизведение и закрывает выходной аудиопоток."""
         self.is_playing = False
         if self._play_stream is not None:
             try:
@@ -350,10 +430,6 @@ class VoiceAudioEngine:
 
         self._update_telemetry(chunk, frame_pos=self._play_cursor)
         return chunk
-
-    # ------------------------------------------------------------------
-    # Измерители уровня (Peak + RMS) и Фазовый коррелятор
-    # ------------------------------------------------------------------
 
     def _update_telemetry(self, block: np.ndarray, frame_pos: int) -> None:
         if block.size == 0:

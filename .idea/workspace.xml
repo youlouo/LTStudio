@@ -4,11 +4,13 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="479e7de5-1df7-4346-8217-46e133fca3c0" name="Changes" comment="LTStudio 1.0">
+    <list default="true" id="479e7de5-1df7-4346-8217-46e133fca3c0" name="Changes" comment="LTStudio 2.0">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/engine/transcription.py" beforeDir="false" afterPath="$PROJECT_DIR$/engine/transcription.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/engine/audio_engine.py" beforeDir="false" afterPath="$PROJECT_DIR$/engine/audio_engine.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/engine/dsp_chain.py" beforeDir="false" afterPath="$PROJECT_DIR$/engine/dsp_chain.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/project/edl.py" beforeDir="false" afterPath="$PROJECT_DIR$/project/edl.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/project/storage.py" beforeDir="false" afterPath="$PROJECT_DIR$/project/storage.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/main_window.py" beforeDir="false" afterPath="$PROJECT_DIR$/ui/main_window.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ui/widgets.py" beforeDir="false" afterPath="$PROJECT_DIR$/ui/widgets.py" afterDir="false" />
     </list>
@@ -55,11 +57,14 @@
   </component>
   <component name="PropertiesComponent"><![CDATA[{
   "keyToString": {
+    "Python.audio_engine.executor": "Run",
     "Python.main.executor": "Run",
+    "Python.main_window.executor": "Run",
     "Python.storage.executor": "Run",
     "Python.transcription.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
-    "git-widget-placeholder": "master"
+    "git-widget-placeholder": "master",
+    "settings.editor.selected.configurable": "preferences.lookFeel"
   }
 }]]></component>
   <component name="SharedIndexes">
@@ -86,11 +91,28 @@
       <option name="project" value="LOCAL" />
       <updated>1793181378804</updated>
     </task>
-    <option name="localTasksCounter" value="2" />
+    <task id="LOCAL-00002" summary="LTStudio 2.0">
+      <option name="closed" value="true" />
+      <created>1793184709363</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1793184709363</updated>
+    </task>
+    <task id="LOCAL-00003" summary="LTStudio 2.0">
+      <option name="closed" value="true" />
+      <created>1793184878365</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1793184878365</updated>
+    </task>
+    <option name="localTasksCounter" value="4" />
     <servers />
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="LTStudio 1.0" />
-    <option name="LAST_COMMIT_MESSAGE" value="LTStudio 1.0" />
+    <MESSAGE value="LTStudio 2.0" />
+    <option name="LAST_COMMIT_MESSAGE" value="LTStudio 2.0" />
   </component>
 </project>

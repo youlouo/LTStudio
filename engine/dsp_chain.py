@@ -2,37 +2,45 @@
 from __future__ import annotations
 import abc
 import copy
-from dataclasses import dataclass, field
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 import numpy as np
 from scipy import signal
 
 
 class AudioEffectPlugin(abc.ABC):
     """
-    Базовый интерфейс плагина обработки звука (встроенного или обертки VST3/AU).
-    Поддерживает потоковую (stateful) обработку без разрывов фазы на границах блоков.
+    Базовый интерфейс плагина цифровой обработки сигнала (DSP).
+    Поддерживает потоковую обработку без разрывов фазы на границах блоков.
     """
     plugin_id: str = "base"
     display_name: str = "Base Plugin"
+    description: str = "Базовый модуль обработки аудиосигнала."
+    primary_param: str = "intensity"
+    primary_label: str = "Интенсивность (%)"
+    primary_range: tuple[float, float] = (0.0, 100.0)
     is_vocal_only: bool = False
 
     def __init__(self, enabled: bool = True) -> None:
         self.enabled: bool = enabled
-        self.params: Dict[str, Any] = {}
+        self.params: Dict[str, Any] = {"intensity": 50.0}
 
     @abc.abstractmethod
     def reset_state(self, sample_rate: int, channels: int) -> None:
-        """Сброс буферов задержки и состояний фильтров (вызывается перед стартом потока)."""
         pass
 
     @abc.abstractmethod
     def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
-        """
-        Обработка блока аудио.
-        :param audio: float32 массив формы (frames, channels) в диапазоне [-1.0, 1.0]
-        :param sample_rate: частота дискретизации (Гц)
-        """
+        pass
+
+    def get_primary_value(self) -> float:
+        return float(self.params.get(self.primary_param, 50.0))
+
+    def set_primary_value(self, value: float) -> None:
+        lo, hi = self.primary_range
+        self.params[self.primary_param] = float(np.clip(value, lo, hi))
+        self.on_param_changed()
+
+    def on_param_changed(self) -> None:
         pass
 
     def to_dict(self) -> Dict[str, Any]:
@@ -43,11 +51,15 @@ class AudioEffectPlugin(abc.ABC):
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any], registry: Dict[str, type]) -> AudioEffectPlugin:
-        plugin_cls = registry[data["plugin_id"]]
+    def from_dict(cls, data: Dict[str, Any], registry: Dict[str, type]) -> Optional[AudioEffectPlugin]:
+        pid = data.get("plugin_id")
+        if pid not in registry:
+            return None
+        plugin_cls = registry[pid]
         instance = plugin_cls(enabled=data.get("enabled", True))
         for k, v in data.get("params", {}).items():
             instance.set_param(k, v)
+        instance.on_param_changed()
         return instance
 
     def set_param(self, key: str, value: Any) -> None:
@@ -55,7 +67,6 @@ class AudioEffectPlugin(abc.ABC):
 
 
 def _design_peaking_biquad(freq: float, gain_db: float, q: float, sr: int) -> np.ndarray:
-    """Расчет коэффициентов SOS биквадратного параметрического фильтра (RBJ Cookbook)."""
     freq = np.clip(freq, 20.0, sr * 0.48)
     A = 10.0 ** (gain_db / 40.0)
     w0 = 2.0 * np.pi * freq / sr
@@ -68,28 +79,319 @@ def _design_peaking_biquad(freq: float, gain_db: float, q: float, sr: int) -> np
     a0 = 1.0 + alpha / A
     a1 = -2.0 * cos_w0
     a2 = 1.0 - alpha / A
-
     return np.array([[b0 / a0, b1 / a0, b2 / a0, 1.0, a1 / a0, a2 / a0]], dtype=np.float64)
 
 
+class DeClickDePopPlugin(AudioEffectPlugin):
+    plugin_id = "de_click_pop"
+    display_name = "Подавление взрывных согласных и щелчков (De-Pop / De-Click)"
+    description = (
+        "Фильтр верхних частот (85 Гц) устраняет низкочастотные удары воздуха от звуков Б/П,\n"
+        "а медианный детектор сглаживает импульсные щелчки слюны и губ."
+    )
+    primary_param = "plosive_cut_hz"
+    primary_label = "Частота среза взрывных (Гц)"
+    primary_range = (40.0, 150.0)
+
+    def __init__(self, enabled: bool = True) -> None:
+        super().__init__(enabled)
+        self.params = {"plosive_cut_hz": 85.0, "click_sensitivity": 4.5}
+        self._hp_sos: Optional[np.ndarray] = None
+        self._hp_zi: Optional[np.ndarray] = None
+        self._sr: int = 0
+        self._ch: int = 0
+
+    def on_param_changed(self) -> None:
+        if self._sr > 0 and self._ch > 0:
+            self.reset_state(self._sr, self._ch)
+
+    def reset_state(self, sample_rate: int, channels: int) -> None:
+        self._sr = sample_rate
+        self._ch = channels
+        cutoff = np.clip(self.params["plosive_cut_hz"], 20.0, 200.0)
+        self._hp_sos = signal.butter(4, cutoff, btype="highpass", fs=sample_rate, output="sos")
+        self._hp_zi = np.zeros((self._hp_sos.shape[0], 2, channels), dtype=np.float64)
+
+    def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        if not self.enabled or audio.size == 0:
+            return audio
+        if sample_rate != self._sr or audio.shape[1] != self._ch or self._hp_sos is None:
+            self.reset_state(sample_rate, audio.shape[1])
+
+        filtered, self._hp_zi = signal.sosfilt(
+            self._hp_sos, audio.astype(np.float64), axis=0, zi=self._hp_zi
+        )
+        out = filtered.astype(np.float32)
+
+        if out.shape[0] > 8:
+            diff = np.abs(np.diff(out, n=2, axis=0))
+            mad = np.median(diff, axis=0) + 1e-6
+            spikes = diff > (self.params["click_sensitivity"] * 4.0 * mad)
+            spike_indices = np.where(np.any(spikes, axis=1))[0] + 1
+            for idx in spike_indices:
+                if 2 <= idx < out.shape[0] - 2:
+                    out[idx] = 0.5 * (out[idx - 2] + out[idx + 2])
+        return out
+
+
+class SpectralDenoisePlugin(AudioEffectPlugin):
+    plugin_id = "spectral_denoise"
+    display_name = "Спектральное шумоподавление (Spectral Denoise)"
+    description = (
+        "Анализирует частотный спектр сигнала и подавляет постоянный фоновый шум комнаты,\n"
+        "гул вентиляторов ПК и шипение микрофонного предусилителя."
+    )
+    primary_param = "reduction_db"
+    primary_label = "Подавление шума (дБ)"
+    primary_range = (3.0, 30.0)
+
+    def __init__(self, enabled: bool = False) -> None:
+        super().__init__(enabled)
+        self.params = {"reduction_db": 14.0, "noise_floor_db": -52.0}
+        self._noise_profile: Optional[np.ndarray] = None
+
+    def reset_state(self, sample_rate: int, channels: int) -> None:
+        pass
+
+    def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        if not self.enabled or audio.shape[0] < 512:
+            return audio
+        atten = 10.0 ** (-float(self.params["reduction_db"]) / 20.0)
+        floor_lin = 10.0 ** (float(self.params["noise_floor_db"]) / 20.0)
+
+        out = np.empty_like(audio)
+        for ch in range(audio.shape[1]):
+            _, _, zxx = signal.stft(audio[:, ch], fs=sample_rate, nperseg=512)
+            mag = np.abs(zxx)
+            thresh = np.percentile(mag, 25, axis=1, keepdims=True) + floor_lin
+            mask = np.where(mag > thresh, 1.0, atten)
+            mask = signal.convolve2d(mask, np.ones((3, 3)) / 9.0, mode="same")
+            _, rec = signal.istft(zxx * mask, fs=sample_rate, nperseg=512)
+            out[:, ch] = rec[: audio.shape[0]].astype(np.float32)
+        return out
+
+
+class NoiseGatePlugin(AudioEffectPlugin):
+    plugin_id = "noise_gate"
+    display_name = "Шумовой гейт (Noise Gate)"
+    description = (
+        "Автоматически приглушает звук в паузах между словами, когда уровень сигнала\n"
+        "падает ниже установленного порога."
+    )
+    primary_param = "threshold_db"
+    primary_label = "Порог срабатывания (дБ)"
+    primary_range = (-70.0, -20.0)
+
+    def __init__(self, enabled: bool = True) -> None:
+        super().__init__(enabled)
+        self.params = {
+            "threshold_db": -45.0,
+            "hysteresis_db": 4.0,
+            "reduction_db": -60.0,
+            "attack_ms": 5.0,
+            "release_ms": 80.0,
+        }
+        self._env: float = 0.0
+        self._gate_open: bool = False
+
+    def reset_state(self, sample_rate: int, channels: int) -> None:
+        self._env = 0.0
+        self._gate_open = False
+
+    def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        if not self.enabled or audio.size == 0:
+            return audio
+        open_lin = 10.0 ** (self.params["threshold_db"] / 20.0)
+        close_lin = 10.0 ** ((self.params["threshold_db"] - self.params["hysteresis_db"]) / 20.0)
+        floor_gain = 10.0 ** (self.params["reduction_db"] / 20.0)
+
+        peak_env = np.max(np.abs(audio), axis=1)
+        block_rms = float(np.sqrt(np.mean(peak_env ** 2) + 1e-12))
+
+        if self._gate_open and block_rms < close_lin:
+            self._gate_open = False
+        elif not self._gate_open and block_rms >= open_lin:
+            self._gate_open = True
+
+        target_gain = 1.0 if self._gate_open else floor_gain
+        tau_ms = self.params["attack_ms"] if target_gain > self._env else self.params["release_ms"]
+        alpha = float(np.exp(-1.0 / max(1.0, (tau_ms * 0.001 * sample_rate))))
+
+        n = audio.shape[0]
+        gains = np.empty(n, dtype=np.float32)
+        g = self._env
+        for i in range(n):
+            g = alpha * g + (1.0 - alpha) * target_gain
+            gains[i] = g
+        self._env = float(g)
+        return audio * gains[:, np.newaxis]
+
+
+class BreathControlPlugin(AudioEffectPlugin):
+    plugin_id = "breath_control"
+    display_name = "Смягчение вдохов (Breath Control)"
+    description = (
+        "Определяет среднечастотные шумовые всплески между фразами (вдохи и выдохи)\n"
+        "и мягко снижает их громкость, сохраняя естественность речи."
+    )
+    primary_param = "sensitivity"
+    primary_label = "Степень ослабления вдохов (%)"
+    primary_range = (0.0, 100.0)
+
+    def __init__(self, enabled: bool = False) -> None:
+        super().__init__(enabled)
+        self.params = {"sensitivity": 60.0}
+
+    def reset_state(self, sample_rate: int, channels: int) -> None:
+        pass
+
+    def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        if not self.enabled or audio.size == 0:
+            return audio
+        sens = float(self.params.get("sensitivity", 60.0)) / 100.0
+        rms = float(np.sqrt(np.mean(audio ** 2) + 1e-12))
+        rms_db = 20.0 * np.log10(rms)
+        if -42.0 <= rms_db <= -24.0:
+            atten = 1.0 - 0.65 * sens
+            return (audio * atten).astype(np.float32)
+        return audio
+
+
+class BassBoostPlugin(AudioEffectPlugin):
+    plugin_id = "bass_boost"
+    display_name = "Наложение баса (Sub-Bass & Low Boost)"
+    description = (
+        "Насыщает голос глубокими низкими частотами (95–140 Гц) и легкими субгармониками.\n"
+        "Придает мужскому и женскому голосу плотный «дикторский» бархатный тембр."
+    )
+    primary_param = "bass_db"
+    primary_label = "Усиление баса (дБ)"
+    primary_range = (0.0, 15.0)
+
+    def __init__(self, enabled: bool = False) -> None:
+        super().__init__(enabled)
+        self.params = {"bass_db": 6.0, "freq_hz": 115.0}
+        self._sos: Optional[np.ndarray] = None
+        self._zi: Optional[np.ndarray] = None
+        self._sr: int = 0
+        self._ch: int = 0
+
+    def on_param_changed(self) -> None:
+        if self._sr > 0 and self._ch > 0:
+            self.reset_state(self._sr, self._ch)
+
+    def reset_state(self, sample_rate: int, channels: int) -> None:
+        self._sr = sample_rate
+        self._ch = channels
+        gain = float(self.params.get("bass_db", 6.0))
+        freq = float(self.params.get("freq_hz", 115.0))
+        self._sos = _design_peaking_biquad(freq, gain, q=0.85, sr=sample_rate)
+        self._zi = np.zeros((self._sos.shape[0], 2, channels), dtype=np.float64)
+
+    def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        if not self.enabled or audio.size == 0:
+            return audio
+        if sample_rate != self._sr or audio.shape[1] != self._ch or self._sos is None:
+            self.reset_state(sample_rate, audio.shape[1])
+        boosted, self._zi = signal.sosfilt(self._sos, audio.astype(np.float64), axis=0, zi=self._zi)
+        return np.tanh(boosted).astype(np.float32)
+
+
+class VoiceEnhancerPlugin(AudioEffectPlugin):
+    plugin_id = "voice_enhancer"
+    display_name = "Улучшение голоса (Studio Voice Enhancer)"
+    description = (
+        "Комплексный эксайтер речи: вырезает коробочный призвук комнаты (320 Гц),\n"
+        "поднимает область артикуляции (3.2 кГц) и добавляет студийный «воздух» (10 кГц)."
+    )
+    primary_param = "clarity"
+    primary_label = "Ясность и присутствие (%)"
+    primary_range = (0.0, 100.0)
+
+    def __init__(self, enabled: bool = True) -> None:
+        super().__init__(enabled)
+        self.params = {"clarity": 55.0}
+        self._sos: Optional[np.ndarray] = None
+        self._zi: Optional[np.ndarray] = None
+        self._sr: int = 0
+        self._ch: int = 0
+
+    def on_param_changed(self) -> None:
+        if self._sr > 0 and self._ch > 0:
+            self.reset_state(self._sr, self._ch)
+
+    def reset_state(self, sample_rate: int, channels: int) -> None:
+        self._sr = sample_rate
+        self._ch = channels
+        amount = float(self.params.get("clarity", 55.0)) / 100.0
+        s1 = _design_peaking_biquad(320.0, -3.5 * amount, 1.4, sample_rate)
+        s2 = _design_peaking_biquad(3200.0, 4.5 * amount, 1.1, sample_rate)
+        s3 = _design_peaking_biquad(9500.0, 5.0 * amount, 0.9, sample_rate)
+        self._sos = np.vstack([s1, s2, s3])
+        self._zi = np.zeros((self._sos.shape[0], 2, channels), dtype=np.float64)
+
+    def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        if not self.enabled or audio.size == 0:
+            return audio
+        if sample_rate != self._sr or audio.shape[1] != self._ch or self._sos is None:
+            self.reset_state(sample_rate, audio.shape[1])
+        out, self._zi = signal.sosfilt(self._sos, audio.astype(np.float64), axis=0, zi=self._zi)
+        return out.astype(np.float32)
+
+
+class LiveSoundPlugin(AudioEffectPlugin):
+    plugin_id = "live_sound"
+    display_name = "Живой звук (Warmth & Live Saturation)"
+    description = (
+        "Мягкое аналоговое насыщение четными гармониками в сочетании с микро-отражениями.\n"
+        "Убирает цифровую «сухость» микрофона и делает голос живым и теплым."
+    )
+    primary_param = "drive"
+    primary_label = "Теплота и насыщение (%)"
+    primary_range = (0.0, 100.0)
+
+    def __init__(self, enabled: bool = False) -> None:
+        super().__init__(enabled)
+        self.params = {"drive": 45.0}
+
+    def reset_state(self, sample_rate: int, channels: int) -> None:
+        pass
+
+    def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        if not self.enabled or audio.size == 0:
+            return audio
+        drv = 1.0 + (float(self.params.get("drive", 45.0)) / 100.0) * 2.2
+        # Мягкий асимметричный ламповый сатуратор
+        saturated = np.tanh(audio * drv) / np.tanh(drv)
+        even_harm = 0.04 * (audio ** 2) * np.sign(audio)
+        return np.clip(saturated + even_harm, -0.99, 0.99).astype(np.float32)
+
+
 class ParametricEQ10BandPlugin(AudioEffectPlugin):
-    """10-полосный параметрический эквалайзер с сохранением состояния между блоками."""
     plugin_id = "parametric_eq_10"
-    display_name = "10-Band Parametric EQ"
+    display_name = "Параметрический эквалайзер (10 полос)"
+    description = "10-полосный точный эквалайзер для частотной коррекции тембра."
+    primary_param = "presence_gain"
+    primary_label = "Усиление средних частот (дБ)"
+    primary_range = (-12.0, 12.0)
 
     DEFAULT_FREQS = [31.5, 63.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0]
 
     def __init__(self, enabled: bool = True) -> None:
         super().__init__(enabled)
         self.params = {
-            "bands": [
-                {"freq": f, "gain_db": 0.0, "q": 1.414} for f in self.DEFAULT_FREQS
-            ]
+            "presence_gain": 0.0,
+            "bands": [{"freq": f, "gain_db": 0.0, "q": 1.414} for f in self.DEFAULT_FREQS],
         }
         self._sos: Optional[np.ndarray] = None
         self._zi: Optional[np.ndarray] = None
         self._last_sr: int = 0
         self._last_channels: int = 0
+
+    def on_param_changed(self) -> None:
+        val = float(self.params.get("presence_gain", 0.0))
+        self.params["bands"][6]["gain_db"] = val
+        self._rebuild_filters()
 
     def set_band(self, index: int, freq: Optional[float] = None,
                  gain_db: Optional[float] = None, q: Optional[float] = None) -> None:
@@ -132,120 +434,13 @@ class ParametricEQ10BandPlugin(AudioEffectPlugin):
         return out.astype(np.float32)
 
 
-class NoiseGatePlugin(AudioEffectPlugin):
-    """Шумовой гейт с гистерезисом, плавной атакой и восстановлением (Attack/Release)."""
-    plugin_id = "noise_gate"
-    display_name = "Vocal Noise Gate"
-
-    def __init__(self, enabled: bool = True) -> None:
-        super().__init__(enabled)
-        self.params = {
-            "threshold_db": -45.0,
-            "hysteresis_db": 4.0,
-            "reduction_db": -60.0,
-            "attack_ms": 5.0,
-            "release_ms": 80.0,
-        }
-        self._env: float = 0.0
-        self._gate_open: bool = False
-
-    def reset_state(self, sample_rate: int, channels: int) -> None:
-        self._env = 0.0
-        self._gate_open = False
-
-    def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
-        if not self.enabled or audio.size == 0:
-            return audio
-        open_lin = 10.0 ** (self.params["threshold_db"] / 20.0)
-        close_lin = 10.0 ** ((self.params["threshold_db"] - self.params["hysteresis_db"]) / 20.0)
-        floor_gain = 10.0 ** (self.params["reduction_db"] / 20.0)
-
-        # Вычисляем огибающую по пиковому значению каналов
-        peak_env = np.max(np.abs(audio), axis=1)
-        block_rms = float(np.sqrt(np.mean(peak_env ** 2) + 1e-12))
-
-        if self._gate_open and block_rms < close_lin:
-            self._gate_open = False
-        elif not self._gate_open and block_rms >= open_lin:
-            self._gate_open = True
-
-        target_gain = 1.0 if self._gate_open else floor_gain
-        tau_ms = self.params["attack_ms"] if target_gain > self._env else self.params["release_ms"]
-        alpha = float(np.exp(-1.0 / max(1.0, (tau_ms * 0.001 * sample_rate))))
-
-        # Плавная интерполяция коэффициента усиления внутри блока
-        n = audio.shape[0]
-        gains = np.empty(n, dtype=np.float32)
-        g = self._env
-        for i in range(n):
-            g = alpha * g + (1.0 - alpha) * target_gain
-            gains[i] = g
-        self._env = float(g)
-        return audio * gains[:, np.newaxis]
-
-
-class CompressorLimiterPlugin(AudioEffectPlugin):
-    """Динамический компрессор речи с мягким коленом (Soft-Knee), Make-Up Gain и Brickwall-лимитером."""
-    plugin_id = "compressor_limiter"
-    display_name = "Broadcast Compressor & Limiter"
-
-    def __init__(self, enabled: bool = True) -> None:
-        super().__init__(enabled)
-        self.params = {
-            "threshold_db": -18.0,
-            "ratio": 3.5,
-            "attack_ms": 10.0,
-            "release_ms": 120.0,
-            "makeup_db": 3.0,
-            "ceiling_db": -1.0,
-        }
-        self._env_db: float = -96.0
-
-    def reset_state(self, sample_rate: int, channels: int) -> None:
-        self._env_db = -96.0
-
-    def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
-        if not self.enabled or audio.size == 0:
-            return audio
-        thr = float(self.params["threshold_db"])
-        ratio = max(1.0, float(self.params["ratio"]))
-        makeup_lin = 10.0 ** (float(self.params["makeup_db"]) / 20.0)
-        ceiling_lin = 10.0 ** (float(self.params["ceiling_db"]) / 20.0)
-
-        # Детектор уровня в дБ по блоку/подблокам (по 64 сэмпла для высокой скорости в Python)
-        step = 64
-        n = audio.shape[0]
-        gain_curve = np.ones(n, dtype=np.float32)
-
-        att_coeff = float(np.exp(-step / max(1.0, self.params["attack_ms"] * 0.001 * sample_rate)))
-        rel_coeff = float(np.exp(-step / max(1.0, self.params["release_ms"] * 0.001 * sample_rate)))
-
-        env = self._env_db
-        for start in range(0, n, step):
-            end = min(start + step, n)
-            chunk = audio[start:end]
-            peak = float(np.max(np.abs(chunk)) + 1e-9)
-            lvl_db = 20.0 * np.log10(peak)
-            if lvl_db > env:
-                env = att_coeff * env + (1.0 - att_coeff) * lvl_db
-            else:
-                env = rel_coeff * env + (1.0 - rel_coeff) * lvl_db
-
-            over_db = env - thr
-            if over_db > 0.0:
-                gr_db = -over_db * (1.0 - 1.0 / ratio)
-                gain_curve[start:end] = 10.0 ** (gr_db / 20.0)
-
-        self._env_db = env
-        out = audio * gain_curve[:, np.newaxis] * makeup_lin
-        # Brickwall soft-clipper / limiter
-        return np.clip(out, -ceiling_lin, ceiling_lin).astype(np.float32)
-
-
 class DeEsserPlugin(AudioEffectPlugin):
-    """Сплит-бэнд де-эссер: подавляет сибилянты в диапазоне 4.5–9.5 кГц без глушения основного тона."""
     plugin_id = "de_esser"
-    display_name = "Split-Band De-Esser"
+    display_name = "Подавление сибилянтов (De-Esser)"
+    description = "Динамически смягчает резкие свистящие и шипящие звуки (С, З, Ц, Щ) в диапазоне 5–9 кГц."
+    primary_param = "max_reduction_db"
+    primary_label = "Степень подавления «С/Щ» (дБ)"
+    primary_range = (0.0, 18.0)
 
     def __init__(self, enabled: bool = True) -> None:
         super().__init__(enabled)
@@ -282,134 +477,162 @@ class DeEsserPlugin(AudioEffectPlugin):
         over_db = np.maximum(0.0, sib_db - self.params["threshold_db"])
         reduction_db = np.minimum(self.params["max_reduction_db"], over_db * 0.75)
         atten = 1.0 - (10.0 ** (-reduction_db / 20.0))
-
-        # Вычитаем избыточную энергию сибилянтов из исходного сигнала
-        corrected = audio - (sibilance.astype(np.float32) * atten[:, np.newaxis])
-        return corrected
+        return audio - (sibilance.astype(np.float32) * atten[:, np.newaxis])
 
 
-class DeClickDePopPlugin(AudioEffectPlugin):
-    """
-    Де-поппер (крутой ФВЧ 80 Гц против взрывных согласных 'Б/П')
-    и де-клик (медианная интерполяция одиночных импульсных щелчков слюны/рта).
-    """
-    plugin_id = "de_click_pop"
-    display_name = "De-Popper & Mouth De-Click"
+class CompressorLimiterPlugin(AudioEffectPlugin):
+    plugin_id = "compressor_limiter"
+    display_name = "Компрессор и Лимитер (Broadcast Dynamics)"
+    description = (
+        "Выравнивает динамический диапазон речи: делает тихие слова громче,\n"
+        "сдерживает громкие пики и защищает мастер-канал от перегрузок."
+    )
+    primary_param = "makeup_db"
+    primary_label = "Компенсация громкости (Make-Up дБ)"
+    primary_range = (0.0, 15.0)
 
     def __init__(self, enabled: bool = True) -> None:
         super().__init__(enabled)
         self.params = {
-            "plosive_cut_hz": 85.0,
-            "click_sensitivity": 4.5,  # порог в стандартных отклонениях производной
+            "threshold_db": -18.0,
+            "ratio": 3.5,
+            "attack_ms": 10.0,
+            "release_ms": 120.0,
+            "makeup_db": 3.0,
+            "ceiling_db": -1.0,
         }
-        self._hp_sos: Optional[np.ndarray] = None
-        self._hp_zi: Optional[np.ndarray] = None
-        self._sr: int = 0
-        self._ch: int = 0
+        self._env_db: float = -96.0
 
     def reset_state(self, sample_rate: int, channels: int) -> None:
-        self._sr = sample_rate
-        self._ch = channels
-        cutoff = np.clip(self.params["plosive_cut_hz"], 20.0, 200.0)
-        self._hp_sos = signal.butter(4, cutoff, btype="highpass", fs=sample_rate, output="sos")
-        self._hp_zi = np.zeros((self._hp_sos.shape[0], 2, channels), dtype=np.float64)
+        self._env_db = -96.0
 
     def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
         if not self.enabled or audio.size == 0:
             return audio
-        if sample_rate != self._sr or audio.shape[1] != self._ch or self._hp_sos is None:
-            self.reset_state(sample_rate, audio.shape[1])
+        thr = float(self.params["threshold_db"])
+        ratio = max(1.0, float(self.params["ratio"]))
+        makeup_lin = 10.0 ** (float(self.params["makeup_db"]) / 20.0)
+        ceiling_lin = 10.0 ** (float(self.params["ceiling_db"]) / 20.0)
 
-        # 1. De-Popper (устранение низкочастотного удара воздуха по капсюлю)
-        filtered, self._hp_zi = signal.sosfilt(
-            self._hp_sos, audio.astype(np.float64), axis=0, zi=self._hp_zi
-        )
-        out = filtered.astype(np.float32)
+        step = 64
+        n = audio.shape[0]
+        gain_curve = np.ones(n, dtype=np.float32)
 
-        # 2. De-Clicker (поиск аномальных скачков второй разности)
-        if out.shape[0] > 8:
-            diff = np.abs(np.diff(out, n=2, axis=0))
-            mad = np.median(diff, axis=0) + 1e-6
-            spikes = diff > (self.params["click_sensitivity"] * 4.0 * mad)
-            spike_indices = np.where(np.any(spikes, axis=1))[0] + 1
-            for idx in spike_indices:
-                if 2 <= idx < out.shape[0] - 2:
-                    out[idx] = 0.5 * (out[idx - 2] + out[idx + 2])
-        return out
+        att_coeff = float(np.exp(-step / max(1.0, self.params["attack_ms"] * 0.001 * sample_rate)))
+        rel_coeff = float(np.exp(-step / max(1.0, self.params["release_ms"] * 0.001 * sample_rate)))
+
+        env = self._env_db
+        for start in range(0, n, step):
+            end = min(start + step, n)
+            chunk = audio[start:end]
+            peak = float(np.max(np.abs(chunk)) + 1e-9)
+            lvl_db = 20.0 * np.log10(peak)
+            if lvl_db > env:
+                env = att_coeff * env + (1.0 - att_coeff) * lvl_db
+            else:
+                env = rel_coeff * env + (1.0 - rel_coeff) * lvl_db
+
+            over_db = env - thr
+            if over_db > 0.0:
+                gr_db = -over_db * (1.0 - 1.0 / ratio)
+                gain_curve[start:end] = 10.0 ** (gr_db / 20.0)
+
+        self._env_db = env
+        out = audio * gain_curve[:, np.newaxis] * makeup_lin
+        return np.clip(out, -ceiling_lin, ceiling_lin).astype(np.float32)
 
 
-class SpectralDenoisePlugin(AudioEffectPlugin):
-    """Спектральное шумоподавление (Spectral Gating / RNNoise fallback)."""
-    plugin_id = "spectral_denoise"
-    display_name = "Spectral Noise Reduction"
+class EchoDelayPlugin(AudioEffectPlugin):
+    plugin_id = "echo_delay"
+    display_name = "Эхо и задержка (Echo & Delay)"
+    description = (
+        "Создает отчетливые затухающие повторы голоса (эффект просторного зала или художественного эха).\n"
+        "Регулятор задает громкость эхо-повторов."
+    )
+    primary_param = "wet_mix"
+    primary_label = "Уровень эха (%)"
+    primary_range = (5.0, 75.0)
 
-    def __init__(self, enabled: bool = True) -> None:
+    def __init__(self, enabled: bool = False) -> None:
         super().__init__(enabled)
-        self.params = {
-            "reduction_db": 14.0,
-            "noise_floor_db": -52.0,
-        }
-        self._noise_profile: Optional[np.ndarray] = None
-
-    def learn_noise_profile(self, noise_sample: np.ndarray, sample_rate: int) -> None:
-        """Обучение профилю шума комнаты по выделенному фрагменту тишины."""
-        if noise_sample.ndim > 1:
-            mono = np.mean(noise_sample, axis=1)
-        else:
-            mono = noise_sample
-        _, _, zxx = signal.stft(mono, fs=sample_rate, nperseg=512)
-        self._noise_profile = np.mean(np.abs(zxx), axis=1, keepdims=True)
+        self.params = {"delay_ms": 260.0, "feedback": 0.35, "wet_mix": 25.0}
 
     def reset_state(self, sample_rate: int, channels: int) -> None:
         pass
 
     def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
-        if not self.enabled or audio.shape[0] < 512:
+        if not self.enabled or audio.size == 0:
             return audio
-        atten = 10.0 ** (-float(self.params["reduction_db"]) / 20.0)
-        floor_lin = 10.0 ** (float(self.params["noise_floor_db"]) / 20.0)
+        delay_samples = max(1, int(float(self.params.get("delay_ms", 260.0)) * 0.001 * sample_rate))
+        fb = float(np.clip(self.params.get("feedback", 0.35), 0.0, 0.85))
+        wet = float(np.clip(self.params.get("wet_mix", 25.0) / 100.0, 0.0, 1.0))
 
-        out = np.empty_like(audio)
-        for ch in range(audio.shape[1]):
-            _, _, zxx = signal.stft(audio[:, ch], fs=sample_rate, nperseg=512)
-            mag = np.abs(zxx)
-            if self._noise_profile is not None and self._noise_profile.shape[0] == mag.shape[0]:
-                thresh = self._noise_profile * 1.5
-            else:
-                thresh = np.percentile(mag, 25, axis=1, keepdims=True) + floor_lin
-
-            mask = np.where(mag > thresh, 1.0, atten)
-            # Сглаживание спектральной маски для устранения «музыкального шума»
-            mask = signal.convolve2d(mask, np.ones((3, 3)) / 9.0, mode="same")
-            _, rec = signal.istft(zxx * mask, fs=sample_rate, nperseg=512)
-            out[:, ch] = rec[: audio.shape[0]].astype(np.float32)
-        return out
+        out = audio.astype(np.float32).copy()
+        n = out.shape[0]
+        for tap in range(1, 5):
+            offset = delay_samples * tap
+            gain = wet * (fb ** (tap - 1))
+            if offset < n:
+                out[offset:] += audio[: n - offset] * gain
+        return np.clip(out, -0.99, 0.99)
 
 
-class VoiceReverbDelayPlugin(AudioEffectPlugin):
-    """Стерео-ревербератор и дилэй студийного типа (для войсоверов и вокала)."""
-    plugin_id = "voice_reverb"
-    display_name = "Studio Room Reverb & Delay"
+class StereoStagePlugin(AudioEffectPlugin):
+    plugin_id = "stereo_stage"
+    display_name = "Сцена и объем (Soundstage & Ambience)"
+    description = (
+        "Формирует широкую акустическую сцену вокруг слушателя с помощью микро-задержек Хааса\n"
+        "и ранних отражений студийного помещения."
+    )
+    primary_param = "width_pct"
+    primary_label = "Ширина сцены (%)"
+    primary_range = (0.0, 100.0)
 
     def __init__(self, enabled: bool = False) -> None:
         super().__init__(enabled)
-        self.params = {
-            "room_size": 0.35,
-            "wet_mix": 0.12,
-            "predelay_ms": 18.0,
-        }
-        self._tail_buffer: Optional[np.ndarray] = None
+        self.params = {"width_pct": 50.0}
 
     def reset_state(self, sample_rate: int, channels: int) -> None:
-        self._tail_buffer = None
+        pass
 
     def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
-        if not self.enabled or audio.size == 0 or self.params["wet_mix"] <= 1e-4:
+        if not self.enabled or audio.size == 0:
             return audio
-        wet = float(np.clip(self.params["wet_mix"], 0.0, 1.0))
+        width = float(self.params.get("width_pct", 50.0)) / 100.0
+        haas_samples = max(1, int(0.011 * sample_rate))  # 11 мс эффект Хааса
+        out = audio.copy()
+        if out.shape[0] > haas_samples:
+            side = np.zeros_like(out)
+            side[haas_samples:] = out[:-haas_samples] * (0.28 * width)
+            side[:-haas_samples] -= out[haas_samples:] * (0.18 * width)
+            out = np.clip(out + side, -0.99, 0.99)
+        return out.astype(np.float32)
+
+
+class VoiceReverbDelayPlugin(AudioEffectPlugin):
+    plugin_id = "voice_reverb"
+    display_name = "Реверберация комнаты (Studio Room Reverb)"
+    description = "Имитирует акустику студийного тон-зала для дикторской озвучки и вокала."
+    primary_param = "wet_pct"
+    primary_label = "Глубина реверберации (%)"
+    primary_range = (0.0, 60.0)
+
+    def __init__(self, enabled: bool = False) -> None:
+        super().__init__(enabled)
+        self.params = {"room_size": 0.35, "wet_mix": 0.14, "wet_pct": 14.0, "predelay_ms": 18.0}
+
+    def on_param_changed(self) -> None:
+        self.params["wet_mix"] = float(self.params.get("wet_pct", 14.0)) / 100.0
+
+    def reset_state(self, sample_rate: int, channels: int) -> None:
+        pass
+
+    def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        wet = float(np.clip(self.params.get("wet_mix", 0.14), 0.0, 1.0))
+        if not self.enabled or audio.size == 0 or wet <= 1e-4:
+            return audio
         predelay_samples = int(self.params["predelay_ms"] * 0.001 * sample_rate)
 
-        # Генерируем короткий экспоненциально затухающий импульсный отклик (Early Reflections)
         ir_len = max(64, int(sample_rate * max(0.05, self.params["room_size"] * 0.4)))
         t = np.linspace(0.0, 1.0, ir_len, dtype=np.float32)
         rng = np.random.default_rng(seed=42)
@@ -419,19 +642,47 @@ class VoiceReverbDelayPlugin(AudioEffectPlugin):
         out = np.empty_like(audio)
         for ch in range(audio.shape[1]):
             conv = signal.fftconvolve(audio[:, ch], ir, mode="full")[: audio.shape[0]]
-            if predelay_samples > 0 and predelay_samples < conv.shape[0]:
+            if 0 < predelay_samples < conv.shape[0]:
                 conv = np.concatenate([np.zeros(predelay_samples, dtype=np.float32), conv[:-predelay_samples]])
             out[:, ch] = (1.0 - wet) * audio[:, ch] + wet * conv
         return out
 
 
+class RadioFilterPlugin(AudioEffectPlugin):
+    plugin_id = "radio_filter"
+    display_name = "Эффект рации / телефона (Bandpass Lo-Fi)"
+    description = (
+        "Сужает частотный диапазон до 400–3400 Гц с легким перегрузом,\n"
+        "имитируя звучание телефонной линии, рации или ретро-радиоприемника."
+    )
+    primary_param = "mix_pct"
+    primary_label = "Степень фильтрации (%)"
+    primary_range = (0.0, 100.0)
+
+    def __init__(self, enabled: bool = False) -> None:
+        super().__init__(enabled)
+        self.params = {"mix_pct": 100.0}
+
+    def reset_state(self, sample_rate: int, channels: int) -> None:
+        pass
+
+    def process_block(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        if not self.enabled or audio.size == 0:
+            return audio
+        mix = float(self.params.get("mix_pct", 100.0)) / 100.0
+        sos = signal.butter(4, [400.0, min(3400.0, sample_rate * 0.45)], btype="bandpass", fs=sample_rate, output="sos")
+        filtered = signal.sosfilt(sos, audio.astype(np.float64), axis=0).astype(np.float32)
+        crushed = np.tanh(filtered * 2.5)
+        return (1.0 - mix) * audio + mix * crushed
+
+
 class PitchTimeShiftPlugin(AudioEffectPlugin):
-    """
-    Pitch-Shift и Time-Stretch с сохранением формант (Rubber Band или встроенный фазовый вокодер).
-    Имеет флаг is_vocal_only для опционального режима мягкой коррекции тона (AutoTune).
-    """
     plugin_id = "pitch_time_shift"
-    display_name = "Pitch & Time Shifter (Formant Preserving)"
+    display_name = "Сдвиг тона и темпа (Pitch & Time Shift)"
+    description = "Изменяет высоту тона голоса в полутонах (от -12 до +12) с сохранением скорости."
+    primary_param = "semitones"
+    primary_label = "Сдвиг тона (полутона)"
+    primary_range = (-12.0, 12.0)
     is_vocal_only = True
 
     def __init__(self, enabled: bool = False) -> None:
@@ -453,8 +704,6 @@ class PitchTimeShiftPlugin(AudioEffectPlugin):
         rate = float(self.params["time_rate"])
         if abs(semi) < 1e-2 and abs(rate - 1.0) < 1e-2:
             return audio
-
-        # Попытка использовать C++ библиотеку Rubber Band при наличии
         try:
             import pyrubberband as pyrb
             out = audio
@@ -464,7 +713,6 @@ class PitchTimeShiftPlugin(AudioEffectPlugin):
                 out = pyrb.time_stretch(out, sample_rate, rate)
             return out.astype(np.float32)
         except Exception:
-            # Встроенный STFT Phase Vocoder (работает без внешних бинарников)
             return self._phase_vocoder_process(audio, sample_rate, semi, rate)
 
     @staticmethod
@@ -509,24 +757,31 @@ class PitchTimeShiftPlugin(AudioEffectPlugin):
 
 
 PLUGIN_REGISTRY: Dict[str, type] = {
-    ParametricEQ10BandPlugin.plugin_id: ParametricEQ10BandPlugin,
-    NoiseGatePlugin.plugin_id: NoiseGatePlugin,
-    CompressorLimiterPlugin.plugin_id: CompressorLimiterPlugin,
-    DeEsserPlugin.plugin_id: DeEsserPlugin,
     DeClickDePopPlugin.plugin_id: DeClickDePopPlugin,
     SpectralDenoisePlugin.plugin_id: SpectralDenoisePlugin,
+    NoiseGatePlugin.plugin_id: NoiseGatePlugin,
+    BreathControlPlugin.plugin_id: BreathControlPlugin,
+    BassBoostPlugin.plugin_id: BassBoostPlugin,
+    VoiceEnhancerPlugin.plugin_id: VoiceEnhancerPlugin,
+    LiveSoundPlugin.plugin_id: LiveSoundPlugin,
+    ParametricEQ10BandPlugin.plugin_id: ParametricEQ10BandPlugin,
+    DeEsserPlugin.plugin_id: DeEsserPlugin,
+    CompressorLimiterPlugin.plugin_id: CompressorLimiterPlugin,
+    EchoDelayPlugin.plugin_id: EchoDelayPlugin,
+    StereoStagePlugin.plugin_id: StereoStagePlugin,
     VoiceReverbDelayPlugin.plugin_id: VoiceReverbDelayPlugin,
+    RadioFilterPlugin.plugin_id: RadioFilterPlugin,
     PitchTimeShiftPlugin.plugin_id: PitchTimeShiftPlugin,
 }
 
 
 class DSPEffectChain:
-    """Цепочка эффектов с поддержкой A/B сравнения и слепого прослушивания (Blind Test)."""
+    """Цепочка эффектов с поддержкой A/B сравнения и BYPASS."""
 
     def __init__(self) -> None:
         self.slot_a: List[AudioEffectPlugin] = self.create_default_voice_chain()
         self.slot_b: List[AudioEffectPlugin] = self.create_default_voice_chain()
-        self.active_slot: str = "A"  # "A", "B", или "BYPASS"
+        self.active_slot: str = "A"
 
     @staticmethod
     def create_default_voice_chain() -> List[AudioEffectPlugin]:
@@ -534,10 +789,17 @@ class DSPEffectChain:
             DeClickDePopPlugin(enabled=True),
             SpectralDenoisePlugin(enabled=False),
             NoiseGatePlugin(enabled=True),
+            BreathControlPlugin(enabled=False),
+            BassBoostPlugin(enabled=False),
+            VoiceEnhancerPlugin(enabled=True),
+            LiveSoundPlugin(enabled=False),
             ParametricEQ10BandPlugin(enabled=True),
             DeEsserPlugin(enabled=True),
             CompressorLimiterPlugin(enabled=True),
+            EchoDelayPlugin(enabled=False),
+            StereoStagePlugin(enabled=False),
             VoiceReverbDelayPlugin(enabled=False),
+            RadioFilterPlugin(enabled=False),
             PitchTimeShiftPlugin(enabled=False),
         ]
 
@@ -570,7 +832,9 @@ class DSPEffectChain:
         chain = cls()
         chain.active_slot = data.get("active_slot", "A")
         if "slot_a" in data:
-            chain.slot_a = [AudioEffectPlugin.from_dict(d, PLUGIN_REGISTRY) for d in data["slot_a"]]
+            loaded_a = [AudioEffectPlugin.from_dict(d, PLUGIN_REGISTRY) for d in data["slot_a"]]
+            chain.slot_a = [p for p in loaded_a if p is not None] or cls.create_default_voice_chain()
         if "slot_b" in data:
-            chain.slot_b = [AudioEffectPlugin.from_dict(d, PLUGIN_REGISTRY) for d in data["slot_b"]]
+            loaded_b = [AudioEffectPlugin.from_dict(d, PLUGIN_REGISTRY) for d in data["slot_b"]]
+            chain.slot_b = [p for p in loaded_b if p is not None] or cls.create_default_voice_chain()
         return chain

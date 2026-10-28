@@ -7,7 +7,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 
 @dataclass
@@ -36,7 +36,7 @@ class ProjectMetadata:
 
 
 class ProjectRepository:
-    """SQLite менеджер проектов LTStudio с поддержкой автосохранения и единого архива .ltproj."""
+    """SQLite менеджер проектов LTStudio с поддержкой создания, загрузки, автосохранения и удаления."""
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path)
@@ -121,6 +121,36 @@ class ProjectRepository:
                 ),
             )
 
+    def load_project_full(self, project_id: str) -> Optional[Tuple[ProjectMetadata, Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]]:
+        """Загружает метаданные, состояние дорожек, цепочку эффектов и транскрипт проекта."""
+        with self._connect() as conn:
+            r = conn.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+            if not r:
+                return None
+            meta = ProjectMetadata(
+                project_id=r["project_id"],
+                title=r["title"],
+                speaker=r["speaker"],
+                description=r["description"],
+                folder=r["folder"],
+                tags=json.loads(r["tags_json"]),
+                is_favorite=bool(r["is_favorite"]),
+                sample_rate=r["sample_rate"],
+                duration_sec=r["duration_sec"],
+                notes=r["notes"],
+                created_at=r["created_at"],
+                updated_at=r["updated_at"],
+            )
+            edl_dict = json.loads(r["edl_json"] or "{}")
+            dsp_dict = json.loads(r["dsp_json"] or "{}")
+            transcript_list = json.loads(r["transcript_json"] or "[]")
+            return meta, edl_dict, dsp_dict, transcript_list
+
+    def delete_project(self, project_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
+            return cur.rowcount > 0
+
     def search_projects(self, query: str = "", folder: Optional[str] = None,
                         only_favorites: bool = False) -> List[ProjectMetadata]:
         sql = "SELECT * FROM projects WHERE 1=1"
@@ -148,7 +178,7 @@ class ProjectRepository:
                     tags=json.loads(r["tags_json"]),
                     is_favorite=bool(r["is_favorite"]),
                     sample_rate=r["sample_rate"],
-                    duration_rate = r["duration_sec"],
+                    duration_sec=r["duration_sec"],
                     notes=r["notes"],
                     created_at=r["created_at"],
                     updated_at=r["updated_at"],
@@ -158,7 +188,6 @@ class ProjectRepository:
 
     def export_project_bundle(self, project_id: str, source_files: List[Path],
                               target_archive: Path) -> Path:
-        """Упаковывает проект LTStudio, исходные WAV/FLAC и цепочку эффектов в единый файл .ltproj."""
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()
             if not row:
@@ -174,7 +203,6 @@ class ProjectRepository:
         return target_archive
 
     def import_project_bundle(self, archive_path: Path, extract_sources_dir: Path) -> str:
-        """Импортирует архив .ltproj в локальную БД и распаковывает исходники."""
         extract_sources_dir.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(archive_path, "r") as zf:
             manifest = json.loads(zf.read("project_manifest.json").decode("utf-8"))
